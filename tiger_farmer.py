@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-Tiger Account Farmer - Infinite Async Loop
+Tiger Account Farmer - Infinite Async Loop + Web Service
 1. Runs forever (until stopped).
 2. Uses asyncio + aiohttp.
-3. Handles 429s with backoff.
-4. Detailed error logging.
-5. Built-in web server for Render.
+3. Built-in web dashboard and OpenAI-compatible proxy.
 """
 import asyncio
 import aiohttp
@@ -23,13 +21,19 @@ REFERRAL_CODE = "njVk"
 REFERRAL_URL = f"{BASE}/ref/{REFERRAL_CODE}"
 LOG_FILE = "tiger_bypass_log.txt"
 ACCOUNTS_FILE = "tiger_accounts.json"
+DASHBOARD_FILE = "dashboard.html"
 
-MAX_CONCURRENT = 20       # Reduced to avoid instant WAF ban
-SEMAPHORE = None          # Limit creating tasks
+MAX_CONCURRENT = 20
+SEMAPHORE = None
 
-# Stats
-stats = {"ok": 0, "fail": 0}
-stats_lock = asyncio.Lock()
+# Global State
+state = {
+    "ok": 0,
+    "fail": 0,
+    "running": True,
+    "tasks": []
+}
+state_lock = asyncio.Lock()
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -48,8 +52,7 @@ def log(msg):
     try:
         with open(LOG_FILE, "a") as f:
             f.write(line + "\n")
-    except:
-        pass
+    except: pass
 
 def rand_ip():
     return ".".join(str(random.randint(1, 254)) for _ in range(4))
@@ -96,8 +99,7 @@ async def get_temp_email(session):
             if r.status != 200: return None, None
             data = await r.json()
             return address, data.get("token")
-    except:
-        return None, None
+    except: return None, None
 
 async def wait_for_code(session, token, timeout=45):
     headers = {"Authorization": f"Bearer {token}"}
@@ -120,21 +122,11 @@ async def wait_for_code(session, token, timeout=45):
         except: pass
     return None
 
-async def update_stats(success):
-    async with stats_lock:
-        if success: stats["ok"] += 1
-        else: stats["fail"] += 1
-        ok = stats["ok"]
-        fail = stats["fail"]
-        if (ok + fail) % 10 == 0:
-            log(f"STATS: {ok} Created | {fail} Failed")
-
 async def worker(worker_id):
     log(f"Worker {worker_id} started.")
-    while True:
+    while state["running"]:
         async with SEMAPHORE:
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
                 username = "u" + "".join(random.choices(string.ascii_lowercase + string.digits, k=9))
                 try:
                     h = get_headers()
@@ -144,126 +136,145 @@ async def worker(worker_id):
                     
                     email, mail_token = await get_temp_email(session)
                     if not email:
-                        await update_stats(False)
+                        async with state_lock: state["fail"] += 1
                         await asyncio.sleep(2)
                         continue
 
-                    verify_params = {"email": email}
-                    async with session.get(f"{BASE}/api/verification", params=verify_params, headers=h, timeout=15) as r:
+                    async with session.get(f"{BASE}/api/verification", params={"email": email}, headers=h, timeout=15) as r:
                         if r.status == 429:
-                            log(f"Worker {worker_id}: 429 Rate Limit on Verify. Sleeping 30s.")
                             await asyncio.sleep(30)
-                            await update_stats(False)
+                            async with state_lock: state["fail"] += 1
                             continue
                         if r.status != 200:
-                            await update_stats(False)
+                            async with state_lock: state["fail"] += 1
                             continue
 
                     code = await wait_for_code(session, mail_token)
                     if not code:
-                        await update_stats(False)
+                        async with state_lock: state["fail"] += 1
                         continue
 
                     password = "Tp" + "".join(random.choices(string.ascii_letters + string.digits, k=10)) + "!"
                     reg_data = {
-                        "username": username,
-                        "password": password,
-                        "email": email,
-                        "verification_code": code,
-                        "aff_code": REFERRAL_CODE,
-                        "aff": REFERRAL_CODE,
-                        "invitation_code": REFERRAL_CODE
+                        "username": username, "password": password, "email": email,
+                        "verification_code": code, "aff": REFERRAL_CODE
                     }
-                    path = random.choice(["/api/user/register", "/api/user/register/"])
-                    async with session.post(f"{BASE}{path}", params={"aff": REFERRAL_CODE}, json=reg_data, headers=h, timeout=15) as r:
-                        if r.status == 429:
-                            log(f"Worker {worker_id}: 429 Rate Limit on Register. Sleeping 30s.")
-                            await asyncio.sleep(30)
-                            await update_stats(False)
-                            continue
-                        resp_data = await r.json()
-                        if not resp_data.get("success"):
-                            log(f"Worker {worker_id}: Reg Fail: {resp_data}")
-                            await update_stats(False)
+                    async with session.post(f"{BASE}/api/user/register", json=reg_data, headers=h, timeout=15) as r:
+                        if r.status != 200 or not (await r.json()).get("success"):
+                            async with state_lock: state["fail"] += 1
                             continue
 
-                    login_data = {"username": username, "password": password}
-                    async with session.post(f"{BASE}/api/user/login", json=login_data, headers=h, timeout=10) as r:
+                    async with session.post(f"{BASE}/api/user/login", json={"username": username, "password": password}, headers=h, timeout=10) as r:
                         if r.status != 200:
-                            await update_stats(False)
+                            async with state_lock: state["fail"] += 1
                             continue
-                        l_resp = await r.json()
-                        user_id = l_resp.get("data", {}).get("id")
+                        user_id = (await r.json()).get("data", {}).get("id")
 
                     h["new-api-user"] = str(user_id)
                     key_data = {"name": "key", "unlimited_quota": True, "expired_time": -1}
                     async with session.post(f"{BASE}/api/token/", json=key_data, headers=h, timeout=10) as r:
                         if r.status == 200:
-                            k_resp = await r.json()
-                            key = k_resp.get("data", {}).get("key")
-                            log(f"✅ Created: {username} | ID: {user_id}")
+                            key = (await r.json()).get("data", {}).get("key")
+                            log(f"✅ Created: {username}")
                             await save_account({
-                                "username": username,
-                                "password": password,
-                                "user_id": user_id,
-                                "api_key": f"sk-{key}",
-                                "created_at": datetime.now().isoformat()
+                                "username": username, "password": password, "user_id": user_id,
+                                "api_key": f"sk-{key}", "created_at": datetime.now().isoformat()
                             })
-                            await update_stats(True)
+                            async with state_lock: state["ok"] += 1
                         else:
-                            await update_stats(False)
+                            async with state_lock: state["fail"] += 1
                 except Exception:
-                    await update_stats(False)
+                    async with state_lock: state["fail"] += 1
             await asyncio.sleep(random.uniform(1, 4))
 
-async def handle_home(request):
-    return aiohttp.web.Response(text="Tiger Farmer is running!")
+# --- WEB SERVICE HANDLERS ---
+
+async def handle_dashboard(request):
+    async with aiofiles.open(DASHBOARD_FILE, mode='r') as f:
+        return aiohttp.web.Response(text=await f.read(), content_type='text/html')
+
+async def handle_status(request):
+    return aiohttp.web.json_response(state)
+
+async def handle_start(request):
+    if not state["running"]:
+        state["running"] = True
+        for i in range(MAX_CONCURRENT):
+            state["tasks"].append(asyncio.create_task(worker(i+1)))
+        log("Farmer started by user.")
+    return aiohttp.web.json_response({"status": "started"})
+
+async def handle_stop(request):
+    state["running"] = False
+    for t in state["tasks"]: t.cancel()
+    state["tasks"] = []
+    log("Farmer stopped by user.")
+    return aiohttp.web.json_response({"status": "stopped"})
 
 async def handle_accounts(request):
-    try:
-        if os.path.exists(ACCOUNTS_FILE):
-            async with aiofiles.open(ACCOUNTS_FILE, mode='r') as f:
-                content = await f.read()
-            return aiohttp.web.Response(text="[" + content.rstrip(",\n") + "]", content_type='application/json')
-        return aiohttp.web.Response(text="[]", content_type='application/json')
-    except Exception as e:
-        return aiohttp.web.Response(text=str(e), status=500)
+    if os.path.exists(ACCOUNTS_FILE):
+        async with aiofiles.open(ACCOUNTS_FILE, mode='r') as f:
+            content = await f.read()
+        return aiohttp.web.Response(text="[" + content.rstrip(",\n") + "]", content_type='application/json')
+    return aiohttp.web.json_response([])
 
 async def handle_logs(request):
-    try:
-        if os.path.exists(LOG_FILE):
-            async with aiofiles.open(LOG_FILE, mode='r') as f:
-                content = await f.read()
-            return aiohttp.web.Response(text=content[-50000:])
-        return aiohttp.web.Response(text="No logs yet.")
-    except Exception as e:
-        return aiohttp.web.Response(text=str(e), status=500)
+    if os.path.exists(LOG_FILE):
+        async with aiofiles.open(LOG_FILE, mode='r') as f:
+            return aiohttp.web.Response(text=(await f.read())[-50000:])
+    return aiohttp.web.Response(text="No logs yet.")
 
-async def run_server():
-    app = aiohttp.web.Application()
-    app.add_routes([
-        aiohttp.web.get('/', handle_home),
-        aiohttp.web.get('/accounts', handle_accounts),
-        aiohttp.web.get('/logs', handle_logs),
-    ])
-    port = int(os.environ.get("PORT", 8080))
-    runner = aiohttp.web.AppRunner(app)
-    await runner.setup()
-    site = aiohttp.web.TCPSite(runner, '0.0.0.0', port)
-    log(f"Web server starting on port {port}...")
-    await site.start()
+async def handle_proxy(request):
+    """OpenAI Proxy - uses farmed keys"""
+    try:
+        if not os.path.exists(ACCOUNTS_FILE):
+            return aiohttp.web.json_response({"error": "No keys farmed yet"}, status=503)
+        
+        async with aiofiles.open(ACCOUNTS_FILE, mode='r') as f:
+            content = await f.read()
+        accounts = json.loads("[" + content.rstrip(",\n") + "]")
+        keys = [a['api_key'] for a in accounts if a.get('api_key') and 'None' not in a['api_key']]
+        
+        if not keys:
+            return aiohttp.web.json_response({"error": "No valid keys found"}, status=503)
+        
+        target_key = random.choice(keys)
+        body = await request.json()
+        
+        async with aiohttp.ClientSession() as session:
+            h = {"Authorization": f"Bearer {target_key}", "Content-Type": "application/json"}
+            async with session.post(f"{BASE}/v1/chat/completions", json=body, headers=h) as r:
+                return aiohttp.web.json_response(await r.json(), status=r.status)
+    except Exception as e:
+        return aiohttp.web.json_response({"error": str(e)}, status=500)
 
 async def main():
     global SEMAPHORE
     SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
-    log(f"--- TIGER INFINITE FARMER ---")
-    log(f"Concurrency: {MAX_CONCURRENT}")
-    asyncio.create_task(run_server())
-    workers = [asyncio.create_task(worker(i+1)) for i in range(MAX_CONCURRENT)]
-    await asyncio.gather(*workers)
+    
+    app = aiohttp.web.Application()
+    app.add_routes([
+        aiohttp.web.get('/', handle_dashboard),
+        aiohttp.web.get('/api/status', handle_status),
+        aiohttp.web.post('/api/start', handle_start),
+        aiohttp.web.post('/api/stop', handle_stop),
+        aiohttp.web.get('/accounts', handle_accounts),
+        aiohttp.web.get('/logs', handle_logs),
+        aiohttp.web.post('/v1/chat/completions', handle_proxy),
+    ])
+    
+    port = int(os.environ.get("PORT", 8080))
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    await aiohttp.web.TCPSite(runner, '0.0.0.0', port).start()
+    log(f"Web service running on port {port}")
+    
+    # Start workers
+    for i in range(MAX_CONCURRENT):
+        state["tasks"].append(asyncio.create_task(worker(i+1)))
+    
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nStopped.")
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass
