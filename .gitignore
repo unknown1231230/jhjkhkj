@@ -1,0 +1,6 @@
+tiger_accounts.json
+tiger_bypass_log.txt
+__pycache__/
+*.pyc
+.env
+node_modules/
