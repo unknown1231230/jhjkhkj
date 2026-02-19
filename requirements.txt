@@ -2,4 +2,3 @@ fastapi
 uvicorn
 aiohttp
 yarl
-gunicorn
