@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: lemon-farmer
+    runtime: python
+    buildCommand: pip3 install -r requirements.txt
+    startCommand: python3 main.py
+    envVars:
+      - key: SUPABASE_URL
+        value: https://ilhazkplkwibumwhxhpk.supabase.co/rest/v1/lemon_keys
+      - key: SUPABASE_KEY
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlsaGF6a3Bsa3dpYnVtd2h4aHBrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjY5NjY4ODQsImV4cCI6MjA4MjU0Mjg4NH0.2lXYxiW3w6upUKB69qE6hOL9uFSNS4bPlSK_hGSVwDQ
