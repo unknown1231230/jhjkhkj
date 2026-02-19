@@ -144,15 +144,35 @@ async def farm_one():
             else:
                 log(f"[-] Key creation failed: {r.status}")
 
+# --- FARMER LOOP ---
+async def farm_loop():
+    log("Infinite farm loop started.")
+    while True:
+        try:
+            # Random delay between 5 and 30 seconds to look slightly more human
+            # and avoid hitting rate limits too aggressively
+            delay = random.randint(5, 30)
+            await asyncio.sleep(delay)
+            
+            log("Starting new farm run...")
+            await farm_one()
+            
+        except Exception as e:
+            log(f"CRITICAL LOOP ERROR: {e}")
+            await asyncio.sleep(60) # Wait a bit more on error
+
 # --- WEB OVERLAY ---
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(farm_loop())
+
 @app.get("/")
 async def root():
-    return {"status": "online", "service": "Lemon Farmer", "time": datetime.now().isoformat()}
-
-@app.get("/farm")
-async def trigger_farm(background_tasks: BackgroundTasks):
-    background_tasks.add_task(farm_one)
-    return {"message": "Farming process started in background."}
+    return {
+        "status": "farming",
+        "service": "Lemon Farmer Infinite",
+        "time": datetime.now().isoformat()
+    }
 
 if __name__ == "__main__":
     import uvicorn
