@@ -69,106 +69,46 @@ async def emailnator_poll(session, email, xsrf, timeout=120):
     return None
 
 # ==========================================
-# PROVIDER: tempmail.lol
-# ==========================================
-async def tempmail_create(session):
-    try:
-        async with session.post("https://api.tempmail.lol/v2/inbox/create") as r:
-            data = await r.json()
-            return data["address"], data["token"]
-    except: return None, None
-
-async def tempmail_poll(session, token, timeout=120):
-    start = datetime.now()
-    while (datetime.now() - start).seconds < timeout:
-        await asyncio.sleep(5)
-        try:
-            async with session.get(f"https://api.tempmail.lol/v2/inbox?token={token}") as r:
-                data = await r.json()
-                emails = data.get("emails", [])
-                if not emails: continue
-                body = emails[0].get("body", "") + emails[0].get("html", "")
-                match = re.search(r'https://lemondata\.cc/api/auth/callback/email\?[^\s"''<>]+', body)
-                if match: return match.group(0).replace("&amp;", "&")
-        except: pass
-    return None
-
-# ==========================================
-# PROVIDER: Guerrilla Mail
-# ==========================================
-async def guerrilla_create(session):
-    try:
-        async with session.get("https://api.guerrillamail.com/ajax.php?f=get_email_address", headers={"User-Agent": UA}) as r:
-            data = await r.json()
-            return data["email_addr"], data["sid_token"]
-    except: return None, None
-
-async def guerrilla_poll(session, sid, timeout=120):
-    start = datetime.now()
-    while (datetime.now() - start).seconds < timeout:
-        await asyncio.sleep(5)
-        try:
-            async with session.get(f"https://api.guerrillamail.com/ajax.php?f=check_email&seq=0&sid_token={sid}", headers={"User-Agent": UA}) as r:
-                data = await r.json()
-                msgs = [m for m in data.get("list", []) if "lemon" in m.get("mail_from","").lower()]
-                if not msgs: continue
-                mid = msgs[0]["mail_id"]
-                async with session.get(f"https://api.guerrillamail.com/ajax.php?f=fetch_email&email_id={mid}&sid_token={sid}", headers={"User-Agent": UA}) as r2:
-                    msg = await r2.json()
-                    match = re.search(r'https://lemondata\.cc/api/auth/callback/email\?[^\s"''<>]+', msg.get("mail_body",""))
-                    if match: return match.group(0).replace("&amp;", "&")
-        except: pass
-    return None
-
-# ==========================================
-# FARMER CORE
+# FARMER CORE (Emailnator-only, v5)
+# Guerrilla & tempmail.lol blocked as of 2026-02-20
 # ==========================================
 async def farm_one():
     jar = aiohttp.CookieJar(unsafe=True)
     async with aiohttp.ClientSession(cookie_jar=jar) as session:
-        # Provider selection
-        choice = random.choice(["gmail", "duck", "guerrilla", "googlemail", "plus"])
-        email, token, provider = None, None, None
-        
-        if choice == "gmail":
-            email, token = await emailnator_create(session, "dotGmail")
-            provider = "emailnator"
-        elif choice == "googlemail":
-            email, token = await emailnator_create(session, "googleMail")
-            provider = "emailnator"
-        elif choice == "plus":
-            email, token = await emailnator_create(session, "plusGmail")
-            provider = "emailnator"
-        elif choice == "guerrilla":
-            email, token = await guerrilla_create(session)
-            provider = "guerrilla"
-        else: # duck / fallback
-            email, token = await tempmail_create(session)
-            provider = "tempmail"
+        # Only Emailnator works now — rotate between Gmail variants
+        etype = random.choice(["dotGmail", "plusGmail", "googleMail"])
+        email, token = await emailnator_create(session, etype)
 
         if not email:
-            email, token = await tempmail_create(session)
-            provider = "tempmail"
-        
-        if not email: return
+            log(f"[-] Emailnator failed for {etype}, retrying...")
+            await asyncio.sleep(3)
+            etype2 = random.choice(["dotGmail", "plusGmail", "googleMail"])
+            email, token = await emailnator_create(session, etype2)
 
-        log(f"[*] Trying {email} ({provider})")
+        if not email:
+            log("[-] All emailnator attempts failed")
+            return
+
+        log(f"[*] Trying {email} ({etype})")
         
         async with session.get(f"{LEMON_BASE}/api/auth/csrf") as r:
             auth_csrf = (await r.json()).get("csrfToken")
         
         async with session.post(f"{LEMON_BASE}/api/auth/signin/email", data={"email":email, "csrfToken":auth_csrf, "callbackUrl":LEMON_BASE, "json":"true"}, headers={"User-Agent":UA}) as r:
-            if r.status == 403 or "Access Denied" in await r.text():
+            txt = await r.text()
+            if r.status == 403 or "Access Denied" in txt:
                 log(f"[-] Domain BLOCKED: {email}")
                 return
+            if r.status != 200:
+                log(f"[-] Sign-in error {r.status}: {txt[:100]}")
+                return
 
-        # Poll
-        link = None
-        if provider == "emailnator": link = await emailnator_poll(session, email, token)
-        elif provider == "guerrilla": link = await guerrilla_poll(session, token)
-        else: link = await tempmail_poll(session, token)
+        # Poll emailnator for magic link
+        link = await emailnator_poll(session, email, token)
 
-        if not link: return
+        if not link:
+            log(f"[-] No magic link received for {email}")
+            return
         
         # Activate + Org + CSRF + Key
         async with session.get(link, headers={"User-Agent":UA}) as r: pass
@@ -190,13 +130,15 @@ async def farm_loop():
         try:
             await asyncio.sleep(random.randint(5, 15))
             await farm_one()
-        except: await asyncio.sleep(30)
+        except Exception as e:
+            log(f"LOOP ERROR: {e}")
+            await asyncio.sleep(30)
 
 @app.on_event("startup")
 async def startup_event(): asyncio.create_task(farm_loop())
 
 @app.get("/")
-async def root(): return {"status":"farming","version":"v4-multi-provider"}
+async def root(): return {"status":"farming","version":"v5-emailnator-only"}
 
 if __name__ == "__main__":
     import uvicorn
